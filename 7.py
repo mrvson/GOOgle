@@ -61,7 +61,7 @@ def split_sentence(sentence: str, max_length: int) -> Iterator[str]:
     if chunk:
         yield " ".join(chunk)
 
-def smart_split(text: str, max_length: int = 999) -> list[str]:
+def smart_split(text: str, max_length: int = 9999) -> list[str]:
     text = normalise_whitespace(text)
     sentences = SENTENCE_END_REGEX.split(text) if text else []
     chunks: list[str] = []
@@ -84,10 +84,36 @@ def smart_split(text: str, max_length: int = 999) -> list[str]:
         chunks.append(" ".join(current))
     return chunks
 
-def split_text_file(input_file: os.PathLike[str] | str, max_length: int = 999) -> list[str]:
+def split_text_file(input_file: os.PathLike[str] | str, max_length: int = 9999) -> list[str]:
     path = Path(input_file)
     text = path.read_text(encoding="utf-8")
     return smart_split(text, max_length)
+
+
+def save_chunks_to_directory(
+    chunks: Iterable[str],
+    output_dir: os.PathLike[str] | str,
+    prefix: str = "chunk_",
+    encoding: str = "utf-8",
+) -> list[str]:
+    """Lưu từng chunk vào thư mục riêng và trả về danh sách chunk."""
+
+    chunk_list = list(chunks)
+    directory = Path(output_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+
+    existing_pattern = f"{prefix}*.txt"
+    for existing_file in directory.glob(existing_pattern):
+        try:
+            existing_file.unlink()
+        except OSError as exc:
+            print(f"⚠ Không thể xóa file cũ {existing_file.name}: {exc}")
+
+    for index, chunk in enumerate(chunk_list, start=1):
+        chunk_file = directory / f"{prefix}{index:04d}.txt"
+        chunk_file.write_text(chunk, encoding=encoding)
+
+    return chunk_list
 
 # ---------------------------------------------------------------------------
 # Selenium automation - ĐÃ CẬP NHẬT
@@ -248,13 +274,53 @@ def build_driver(download_dir: Path) -> webdriver.Chrome:
         time.sleep(2)
         return build_driver(download_dir)  # Đệ quy thử lại
 
-def wait_for_new_file(download_dir: Path, existing: set[Path], timeout=120):
-    end = time.time() + timeout
-    while time.time() < end:
-        for f in download_dir.iterdir():
-            if f not in existing and f.is_file() and not f.name.endswith(".crdownload"):
-                return f
-        time.sleep(1)
+def wait_for_new_file(
+    download_dir: Path,
+    existing: set[Path],
+    timeout: float = 120,
+    poll_interval: float = 0.2,
+    stable_checks: int = 3,
+) -> Path:
+    """Đợi file mới xuất hiện trong thư mục download nhanh hơn và an toàn hơn.
+
+    Hàm sẽ poll thư mục với tần suất cao hơn (mặc định 0.2s) và chỉ trả về
+    file mới khi kích thước ổn định sau ``stable_checks`` lần kiểm tra liên tiếp.
+    Cách làm này giúp giảm thời gian phát hiện file mới mà vẫn tránh đọc phải
+    file đang ghi dở hoặc file *.crdownload.
+    """
+
+    deadline = time.time() + timeout
+    existing_names = {path.name for path in existing}
+    stable_map: dict[str, tuple[int, float, int]] = {}
+
+    while time.time() < deadline:
+        with os.scandir(download_dir) as entries:
+            for entry in entries:
+                if entry.name in existing_names or entry.is_dir():
+                    continue
+
+                if entry.name.endswith(".crdownload"):
+                    stable_map.pop(entry.name, None)
+                    continue
+
+                stat = entry.stat()
+                key = entry.name
+                size = stat.st_size
+                mtime = stat.st_mtime
+
+                previous = stable_map.get(key)
+                if previous and previous[0] == size and previous[1] == mtime:
+                    count = previous[2] + 1
+                else:
+                    count = 1
+
+                stable_map[key] = (size, mtime, count)
+
+                if count >= stable_checks:
+                    return Path(entry.path)
+
+        time.sleep(poll_interval)
+
     raise TimeoutException("Timeout waiting for download")
 
 def build_target_name(template: str, index: int, original_path: Path) -> str:
@@ -1126,6 +1192,7 @@ def main():
     SCRIPT_DIR = Path(__file__).resolve().parent
     input_file = SCRIPT_DIR / "input.txt"
     download_dir = SCRIPT_DIR / "downloads"
+    chunk_dir = SCRIPT_DIR / "chunks"
     filename_template = "audio_chunk_{index:04d}.wav"
     final_filename = "output_final.wav"
 
@@ -1147,6 +1214,8 @@ def main():
 
     print("🚀 Bắt đầu automation...")
     chunks = split_text_file(input_file)
+    chunks = save_chunks_to_directory(chunks, chunk_dir)
+    print(f"📁 Đã lưu chunk vào thư mục: {chunk_dir}")
     print(f"📄 Đã chia thành {len(chunks)} chunk")
 
     results = automate_google_ai_simple(
